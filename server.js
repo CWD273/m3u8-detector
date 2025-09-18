@@ -42,15 +42,15 @@ function extractMeta(html) {
 
 app.get('/scrape', async (req, res) => {
   const target = req.query.url;
-  if (!target) return res.status(400).json({ error: 'Missing ?url=' });
-  if (!isAllowed(target)) return res.status(403).json({ error: 'Domain not allowed' });
+  if (!target) return res.status(400).json({ ok: false, error: 'Missing ?url=' });
+  if (!isAllowed(target)) return res.status(403).json({ ok: false, error: 'Domain not allowed' });
 
   let browser;
   try {
     browser = await puppeteer.launch({
       headless: 'new',
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
-      executablePath: puppeteer.executablePath() // ✅ Use bundled Chromium
+      executablePath: puppeteer.executablePath()
     });
 
     const page = await browser.newPage();
@@ -64,14 +64,33 @@ app.get('/scrape', async (req, res) => {
     await page.goto(target, { waitUntil: 'networkidle2', timeout: 30000 });
     await page.waitForTimeout(5000);
 
+    const finalUrl = page.url();
     const html = await page.content();
+
+    // Log redirect behavior
+    if (finalUrl !== target) {
+      console.warn(`Redirected from ${target} to ${finalUrl}`);
+    }
+
+    // Log if HTML looks like an error page
+    if (html.startsWith('<!DOCTYPE')) {
+      console.warn('Received HTML page instead of stream content');
+      console.log(html.slice(0, 500));
+    }
+
     const meta = extractMeta(html);
-    const baseUrl = page.url();
     const urls = Array.from(m3u8Urls);
     const best = urls.find(u => /master|index|playlist/i.test(u)) || urls[0] || null;
 
-    res.json({ ok: true, page: baseUrl, meta, m3u8Urls: urls, best });
+    res.json({
+      ok: true,
+      page: finalUrl,
+      meta,
+      m3u8Urls: urls,
+      best
+    });
   } catch (err) {
+    console.error('Scrape error:', err);
     res.status(500).json({ ok: false, error: err.message || 'Puppeteer failed' });
   } finally {
     if (browser) await browser.close();
@@ -109,6 +128,7 @@ app.get('/proxy', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     upstream.data.pipe(res);
   } catch (err) {
+    console.error('Proxy error:', err);
     res.status(502).send(`Upstream error: ${err.message || 'Bad gateway'}`);
   }
 });
@@ -116,3 +136,4 @@ app.get('/proxy', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Server running at http://localhost:${PORT}`);
 });
+  
