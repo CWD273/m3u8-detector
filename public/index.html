@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>M3U8 fetch & detect</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; color: #111; }
+    .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
+    input[type="url"] { flex: 1; min-width: 280px; padding: .6rem; }
+    button { padding: .6rem 1rem; }
+    video { width: 100%; max-width: 960px; margin-top: 1rem; background: #000; }
+    .panel { margin-top: 1rem; padding: .75rem; border: 1px solid #ddd; border-radius: 8px; }
+    .label { font-weight: 600; }
+    .muted { color: #666; }
+    code { background: #f6f8fa; padding: .15rem .3rem; border-radius: 4px; }
+    .meta { display: grid; grid-template-columns: 160px 1fr; gap: .5rem 1rem; }
+    .badge { display: inline-block; padding: .2rem .45rem; border: 1px solid #ccc; border-radius: 999px; font-size: .85rem; margin-right: .25rem; }
+  </style>
+</head>
+<body>
+  <h1>M3U8 fetch & detect</h1>
+  <div class="row">
+    <input id="pageUrl" type="url" placeholder="https://example.com/page-with-player" />
+    <button id="scanBtn">Scan page</button>
+    <button id="stopBtn">Stop</button>
+  </div>
+
+  <div class="panel">
+    <div><span class="label">Detected stream:</span> <span id="detectedStream" class="muted">None</span></div>
+    <div><span class="label">Current program:</span> <span id="detectedProgram" class="muted">Unknown</span></div>
+    <div><span class="label">Status:</span> <span id="status">Idle</span></div>
+  </div>
+
+  <video id="player" controls playsinline></video>
+
+  <div class="panel">
+    <div class="label">Metadata</div>
+    <div class="meta">
+      <div>Page title</div><div id="pageTitle" class="muted">—</div>
+      <div>Open Graph title</div><div id="ogTitle" class="muted">—</div>
+      <div>OG description</div><div id="ogDesc" class="muted">—</div>
+      <div>HLS levels</div><div id="levels" class="muted">—</div>
+      <div>ID3 tags seen</div><div id="id3" class="muted">—</div>
+      <div>Program date-time</div><div id="pdt" class="muted">—</div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
+  <script>
+    const pageUrlEl = document.getElementById('pageUrl');
+    const scanBtn = document.getElementById('scanBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const player = document.getElementById('player');
+    const statusEl = document.getElementById('status');
+    const streamEl = document.getElementById('detectedStream');
+    const programEl = document.getElementById('detectedProgram');
+    const pageTitleEl = document.getElementById('pageTitle');
+    const ogTitleEl = document.getElementById('ogTitle');
+    const ogDescEl = document.getElementById('ogDesc');
+    const levelsEl = document.getElementById('levels');
+    const id3El = document.getElementById('id3');
+    const pdtEl = document.getElementById('pdt');
+
+    let hls = null;
+    let id3Seen = new Set();
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+    function setProgram(msg) {
+      programEl.textContent = msg || 'Unknown';
+      // Reflect to Media Session if available
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: msg || 'Unknown program',
+          artist: 'HLS Stream',
+          album: 'Live',
+        });
+      }
+    }
+
+    class ProxyLoader extends Hls.DefaultConfig.loader {
+      constructor(config) {
+        super(config);
+      }
+      load(context, config, callbacks) {
+        try {
+          // Resolve relative URLs via baseURL when present
+          const abs = new URL(context.url, context.baseURL || window.location.href).href;
+          context.url = `/proxy?src=${encodeURIComponent(abs)}`;
+        } catch (e) {
+          console.warn('URL resolve failed, using raw', context.url);
+        }
+        return super.load(context, config, callbacks);
+      }
+    }
+
+    function resetPlayer() {
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+      player.removeAttribute('src');
+      player.load();
+      id3Seen = new Set();
+      id3El.textContent = '—';
+      pdtEl.textContent = '—';
+      levelsEl.textContent = '—';
+      streamEl.textContent = 'None';
+      setProgram('Unknown');
+    }
+
+    async function scanAndPlay() {
+      resetPlayer();
+      const pageUrl = pageUrlEl.value.trim();
+      if (!pageUrl) {
+        setStatus('Please enter a page URL.');
+        return;
+      }
+      setStatus('Scanning page...');
+      try {
+        const r = await fetch(`/scrape?url=${encodeURIComponent(pageUrl)}`);
+        const data = await r.json();
+        if (!data.ok) throw new Error(data.error || 'Scan failed');
+
+        pageTitleEl.textContent = data.meta?.title || '—';
+        ogTitleEl.textContent = data.meta?.ogTitle || '—';
+        ogDescEl.textContent = data.meta?.ogDescription || '—';
+
+        const stream = data.best || data.m3u8Urls?.[0];
+        if (!stream) {
+          setStatus('No m3u8 found.');
+          return;
+        }
+        streamEl.textContent = stream;
+
+        // Prefer OG/title as initial guess for "what’s playing"
+        setProgram(data.meta?.ogTitle || data.meta?.title || 'Unknown');
+
+        if (Hls.isSupported()) {
+          hls = new Hls({
+            enableWorker: true,
+            lowLatencyMode: true,
+            backBufferLength: 60,
+            liveSyncDuration: 3,
+            liveMaxLatencyDuration: 10,
+            loader: ProxyLoader
+          });
+
+          hls.on(Hls.Events.MEDIA_ATTACHED, () => setStatus('Media attached.'));
+          hls.on(Hls.Events.MANIFEST_PARSED, (_, d) => {
+            levelsEl.textContent = (d.levels || [])
+              .map((lv, i) => `${i}: ${Math.round(lv.bitrate/1000)} kbps ${lv.width || ''}x${lv.height || ''}`.trim())
+              .join(', ') || '—';
+            setStatus('Manifest parsed. Starting playback...');
+            player.play().catch(() => setStatus('Ready. Click play to start.'));
+          });
+
+          // Timed ID3 metadata (e.g., TIT2, TXXX frames)
+          hls.on(Hls.Events.FRAG_PARSING_METADATA, (_, data) => {
+            const parts = [];
+            for (const sample of data.samples) {
+              const txt = parseID3(sample);
+              if (txt) {
+                parts.push(txt);
+                id3Seen.add(txt);
+              }
+            }
+            if (parts.length) {
+              const latest = parts.join(' | ');
+              id3El.textContent = Array.from(id3Seen).slice(-6).join(' • ');
+              // Update detected program on meaningful change
+              setProgram(latest);
+            }
+          });
+
+          // Program Date-Time (EXT-X-PROGRAM-DATE-TIME)
+          hls.on(Hls.Events.LEVEL_PARSING_COMPLETE, (_, data) => {
+            const pdt = data?.details?.programDateTime;
+            if (pdt) {
+              const dt = new Date(pdt);
+              pdtEl.textContent = isNaN(dt) ? String(pdt) : dt.toLocaleString();
+            }
+          });
+
+          hls.on(Hls.Events.ERROR, (_, data) => {
+            console.warn('HLS error:', data);
+            setStatus(`HLS ${data.fatal ? 'fatal ' : ''}error: ${data.details || data.type}`);
+            if (data.fatal) {
+              switch (data.type) {
+                case Hls.ErrorTypes.NETWORK_ERROR:
+                  hls.startLoad();
+                  break;
+                case Hls.ErrorTypes.MEDIA_ERROR:
+                  hls.recoverMediaError();
+                  break;
+                default:
+                  resetPlayer();
+              }
+            }
+          });
+
+          hls.attachMedia(player);
+          // Route initial manifest through proxy; loader will rewrite subsequent requests
+          hls.loadSource(`/proxy?src=${encodeURIComponent(stream)}`);
+
+        } else if (player.canPlayType('application/vnd.apple.mpegurl')) {
+          // Safari
+          player.src = `/proxy?src=${encodeURIComponent(stream)}`;
+          player.addEventListener('loadedmetadata', () => player.play().catch(()=>{}));
+        } else {
+          setStatus('HLS not supported in this browser.');
+        }
+      } catch (e) {
+        console.error(e);
+        setStatus(`Error: ${e.message}`);
+      }
+    }
+
+    function parseID3(sample) {
+      // hls.js exposes raw ID3 payload; we’ll do a lightweight parse:
+      // Many broadcasters put UTF-8 text frames; try to decode as text.
+      try {
+        const bytes = sample.data;
+        // Find readable ASCII/UTF-8 strings of length >= 3 as a simple heuristic
+        let str = '';
+        for (let i = 0; i < bytes.length; i++) {
+          const c = bytes[i];
+          if (c === 0x00 || c === 0x03) continue; // skip some nulls/utf-8 markers
+          if (c >= 0x09 && c <= 0x7E) {
+            str += String.fromCharCode(c);
+          } else {
+            str += ' ';
+          }
+        }
+        str = str.replace(/\s+/g, ' ').trim();
+        // Common keys to extract
+        const m = str.match(/(TIT2|TXXX|PRIV|title|program|now playing)\s*[:=]\s*([^|]{3,})/i);
+        if (m) return m[2].trim();
+        // If looks like a clean sentence, return it
+        if (str.length >= 5 && /[A-Za-z]/.test(str)) return str.slice(0, 140);
+      } catch {}
+      return null;
+    }
+
+    scanBtn.addEventListener('click', scanAndPlay);
+    stopBtn.addEventListener('click', resetPlayer);
+  </script>
+</body>
+  </html>
+  
