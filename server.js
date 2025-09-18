@@ -61,7 +61,7 @@ app.get('/scrape', async (req, res) => {
     });
 
     await page.goto(target, { waitUntil: 'networkidle2', timeout: 30000 });
-    await page.waitForTimeout(5000); // give time for JS to load streams
+    await page.waitForTimeout(5000);
 
     const html = await page.content();
     const meta = extractMeta(html);
